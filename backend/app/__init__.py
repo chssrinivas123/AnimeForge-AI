@@ -1,0 +1,1 @@
+"""AnimeForge AI application package."""

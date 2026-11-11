@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 .env
 *.db
+.godot/
+backend/generated_scenes/*
+!backend/generated_scenes/.gitkeep
 
 # Node
 frontend/node_modules/

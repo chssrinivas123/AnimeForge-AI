@@ -84,6 +84,27 @@ npm install
 npm run dev -- --host 0.0.0.0
 ```
 
+## Godot procedural scene generation
+
+The Godot 4.7.2 project in `godot/` creates a lightweight battlefield scene using built-in meshes and materials. The first generator uses the submitted description as scene metadata and creates a fixed procedural layout; it does not interpret arbitrary prompts with an AI model.
+
+Configure `GODOT_EXECUTABLE` in the backend process environment. For the supplied Windows download, the executable is inside the directory that shares its name:
+
+```powershell
+$env:GODOT_EXECUTABLE = "C:\Users\SRINIVAS\Downloads\Godot_v4.7.2-stable_win64.exe\Godot_v4.7.2-stable_win64.exe"
+```
+
+The backend runs one Godot generation at a time per generated-scenes directory. Start a single Uvicorn worker (do not add `--workers`):
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Create a job with `POST /api/projects/{project_id}/generation-jobs` and JSON body `{"prompt":"..."}`. Poll `GET /api/generation-jobs/{job_id}` for `queued`, `running`, `completed`, or `failed`. A completed job provides a `scene_url`; `POST /api/generation-jobs/{job_id}/open` opens that generated scene in Godot on the backend host. Generated `.tscn` files are stored under `backend/generated_scenes/<job_id>/`.
+
+The renderer uses Godot's Compatibility renderer and simple low-poly geometry for integrated graphics. Headless generation validates and writes the scene but does not visually render or inspect it.
+
 ## Testing
 
 Run the backend API tests and database integration tests:

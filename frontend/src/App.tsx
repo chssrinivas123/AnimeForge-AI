@@ -1,614 +1,787 @@
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  AnimationStep,
+  AuxiliaryStep,
+  CharactersStep,
+  FinalVideoStep,
+  SceneGenerationStep,
+  StoryStep,
+  StoryboardStep,
+} from './components/WorkflowSteps'
+import { StudioFrame } from './components/StudioFrame'
 import './App.css'
+import type {
+  Character,
+  CharacterPayload,
+  GenerationJob,
+  Project,
+  Scene,
+  Shot,
+  ShotPayload,
+  Story,
+  WorkflowStepId,
+} from './types'
 
-const API_BASE = 'http://127.0.0.1:8000'
-const STORAGE_KEY = 'animeforge-ui'
-
-type Project = {
-  id: string
-  name: string
-  description: string
-  status: string
-  genre: string
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+const CACHE_KEY = 'animeforge-studio-cache-v1'
+const WORKFLOW_KEY = 'animeforge-workflow-v1'
+const STEPS: WorkflowStepId[] = ['story', 'characters', 'storyboard', 'scenes', 'animation', 'final-video']
+const STEP_LABELS: Record<WorkflowStepId, string> = {
+  story: 'Story',
+  characters: 'Characters',
+  storyboard: 'Storyboard',
+  scenes: '3D Scenes',
+  animation: 'Animation',
+  'final-video': 'Final Video',
 }
 
-type Story = {
-  id: string
-  title: string
-  prompt: string
-  genre: string
-  art_style: string
-  episode_duration: number
-  character_count: number
-  outline: { title: string; description: string }[]
+type StudioCache = {
+  projects: Project[]
+  stories: Story[]
+  characters: Character[]
 }
 
-type Character = {
-  id: string
-  name: string
-  role: string
-  personality: string
-  appearance: string
-  powers: string
-  reference_image?: string
+type WorkflowPreferences = {
+  selectedProjectId: string
+  stepsByProject: Record<string, WorkflowStepId>
+  approvedStoryByProject: Record<string, string>
+  generationJobByProject: Record<string, string>
 }
 
-type ActivityItem = {
-  title: string
-  detail: string
-  time: string
+const EMPTY_CACHE: StudioCache = { projects: [], stories: [], characters: [] }
+const EMPTY_PREFERENCES: WorkflowPreferences = {
+  selectedProjectId: '',
+  stepsByProject: {},
+  approvedStoryByProject: {},
+  generationJobByProject: {},
 }
 
-type DashboardData = {
-  totalProjects: number
-  totalCharacters: number
-  totalScenes: number
-  completedRenders: number
-  activity: ActivityItem[]
+const EMPTY_CHARACTER: CharacterPayload = {
+  name: '',
+  role: 'Hero',
+  appearance: '',
+  personality: '',
+  powers: '',
+  description: '',
+  weapon: '',
 }
 
-const initialDashboard: DashboardData = {
-  totalProjects: 0,
-  totalCharacters: 0,
-  totalScenes: 0,
-  completedRenders: 0,
-  activity: [
-    { title: 'Storyboard approved', detail: 'Episode 02 used the cinematic dev preview.', time: '2h ago' },
-    { title: 'New character unlocked', detail: 'Ari Sol was added to the prototype cast.', time: '5h ago' },
-    { title: 'Render queued', detail: 'Final shot package is waiting on GPU approval.', time: '1d ago' },
-  ],
+function readStorage<T>(key: string, fallback: T): T {
+  try {
+    const stored = localStorage.getItem(key)
+    return stored ? { ...fallback, ...JSON.parse(stored) } : fallback
+  } catch {
+    return fallback
+  }
 }
 
-function App() {
-  const [projects, setProjects] = useState<Project[]>([])
-  const [stories, setStories] = useState<Story[]>([])
-  const [characters, setCharacters] = useState<Character[]>([])
-  const [dashboard, setDashboard] = useState<DashboardData>(initialDashboard)
-  const [loading, setLoading] = useState(true)
-  const [errorMessage, setErrorMessage] = useState<string | null>(null)
-  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+const initialCache = readStorage(CACHE_KEY, EMPTY_CACHE)
+const initialPreferences = readStorage(WORKFLOW_KEY, EMPTY_PREFERENCES)
 
-  const [projectName, setProjectName] = useState('')
-  const [projectDescription, setProjectDescription] = useState('')
-  const [projectStatus, setProjectStatus] = useState('Concept')
-  const [projectGenre, setProjectGenre] = useState('Fantasy')
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...init?.headers,
+    },
+  })
 
-  const [prompt, setPrompt] = useState('A young guardian must restore a shattered moon to save an island kingdom from a cursed eclipse.')
-  const [genre, setGenre] = useState('Fantasy')
-  const [artStyle, setArtStyle] = useState('Cinematic 3D Anime')
-  const [episodeDuration, setEpisodeDuration] = useState(24)
-  const [characterCount, setCharacterCount] = useState(4)
-
-  const [characterName, setCharacterName] = useState('')
-  const [characterRole, setCharacterRole] = useState('Hero')
-  const [characterPersonality, setCharacterPersonality] = useState('Driven')
-  const [characterAppearance, setCharacterAppearance] = useState('')
-  const [characterPowers, setCharacterPowers] = useState('')
-
-  useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved) as {
-          projects?: Project[]
-          characters?: Character[]
-          stories?: Story[]
-        }
-        if (parsed.projects) setProjects(parsed.projects)
-        if (parsed.characters) setCharacters(parsed.characters)
-        if (parsed.stories) setStories(parsed.stories)
-      } catch {
-        localStorage.removeItem(STORAGE_KEY)
-      }
-    }
-  }, [])
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ projects, characters, stories }))
-  }, [projects, characters, stories])
-
-  const loadDashboard = async () => {
+  if (!response.ok) {
+    let detail = `Request failed (${response.status})`
     try {
-      const [dashboardResponse, projectsResponse, charactersResponse, storiesResponse] = await Promise.all([
-        fetch(`${API_BASE}/api/dashboard`),
-        fetch(`${API_BASE}/api/projects`),
-        fetch(`${API_BASE}/api/characters`),
-        fetch(`${API_BASE}/api/stories`),
-      ])
-
-      if (!dashboardResponse.ok || !projectsResponse.ok || !charactersResponse.ok || !storiesResponse.ok) {
-        throw new Error('Backend API unavailable')
-      }
-
-      const dashboardData = await dashboardResponse.json()
-      const projectData = await projectsResponse.json()
-      const characterData = await charactersResponse.json()
-      const storyData = await storiesResponse.json()
-
-      setDashboard({
-        totalProjects: dashboardData.totalProjects ?? projectData.length,
-        totalCharacters: dashboardData.totalCharacters ?? characterData.length,
-        totalScenes: dashboardData.totalScenes ?? 0,
-        completedRenders: dashboardData.completedRenders ?? 0,
-        activity: dashboardData.activity ?? initialDashboard.activity,
-      })
-      setProjects(projectData)
-      setCharacters(characterData)
-      setStories(storyData)
-      setErrorMessage(null)
+      const body: { detail?: string; message?: string } = await response.json()
+      detail = body.detail ?? body.message ?? detail
     } catch {
-      setDashboard((current) => ({ ...current, totalProjects: current.totalProjects || projects.length || 1 }))
-      setErrorMessage('Backend is unavailable; showing locally persisted data.')
-    } finally {
-      setLoading(false)
+      // Keep the HTTP status as the actionable error when the response is not JSON.
     }
+    throw new Error(detail)
   }
 
+  if (response.status === 204) return undefined as T
+  return response.json() as Promise<T>
+}
+
+function jsonBody(value: unknown): string {
+  return JSON.stringify(value)
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
+}
+
+export default function App() {
+  const [projects, setProjects] = useState<Project[]>(initialCache.projects)
+  const [selectedProjectId, setSelectedProjectId] = useState(initialPreferences.selectedProjectId)
+  const [currentStep, setCurrentStep] = useState<WorkflowStepId>(
+    initialPreferences.stepsByProject[initialPreferences.selectedProjectId] ?? 'story',
+  )
+  const [view, setView] = useState<'workflow' | 'account' | 'settings'>('workflow')
+  const [stories, setStories] = useState<Story[]>(initialCache.stories)
+  const [characters, setCharacters] = useState<Character[]>(initialCache.characters)
+  const [activeStory, setActiveStory] = useState<Story | null>(null)
+  const [storyTitle, setStoryTitle] = useState('')
+  const [storyPrompt, setStoryPrompt] = useState('')
+  const [genre, setGenre] = useState('Fantasy')
+  const [tone, setTone] = useState('Dramatic')
+  const [artStyle, setArtStyle] = useState('Cinematic 3D Anime')
+  const [episodeDuration, setEpisodeDuration] = useState(24)
+  const [characterCount, setCharacterCount] = useState(3)
+  const [storySaved, setStorySaved] = useState(true)
+  const [storyGenerating, setStoryGenerating] = useState(false)
+  const [storySaving, setStorySaving] = useState(false)
+  const [characterDraft, setCharacterDraft] = useState<CharacterPayload>(EMPTY_CHARACTER)
+  const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(null)
+  const [characterSaving, setCharacterSaving] = useState(false)
+  const [scenes, setScenes] = useState<Scene[]>([])
+  const [selectedSceneId, setSelectedSceneId] = useState('')
+  const [generationPrompt, setGenerationPrompt] = useState('')
+  const [generationJob, setGenerationJob] = useState<GenerationJob | null>(null)
+  const [generationSubmitting, setGenerationSubmitting] = useState(false)
+  const [openingScene, setOpeningScene] = useState(false)
+  const [projectsLoading, setProjectsLoading] = useState(true)
+  const [workspaceLoading, setWorkspaceLoading] = useState(false)
+  const [pageError, setPageError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [preferences, setPreferences] = useState(initialPreferences)
+
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
+  const projectCharacters = characters.filter((character) => character.project_id === selectedProjectId)
+  const isApproved = Boolean(
+    selectedProjectId && activeStory && preferences.approvedStoryByProject[selectedProjectId] === activeStory.id,
+  )
+
   useEffect(() => {
-    void loadDashboard()
+    localStorage.setItem(CACHE_KEY, jsonBody({ projects, stories, characters }))
+  }, [projects, stories, characters])
+
+  useEffect(() => {
+    localStorage.setItem(WORKFLOW_KEY, jsonBody(preferences))
+  }, [preferences])
+
+  useEffect(() => {
+    let disposed = false
+    requestJson<Project[]>('/api/projects')
+      .then((result) => {
+        if (disposed) return
+        setProjects(result)
+        const preferredId = initialPreferences.selectedProjectId
+        const nextId = result.some((project) => project.id === preferredId)
+          ? preferredId
+          : result[0]?.id ?? ''
+        setSelectedProjectId(nextId)
+        setPreferences((current) => ({ ...current, selectedProjectId: nextId }))
+        setCurrentStep(initialPreferences.stepsByProject[nextId] ?? 'story')
+      })
+      .catch((error: unknown) => {
+        if (disposed) return
+        setPageError(`Could not load projects from the backend: ${getErrorMessage(error)}`)
+      })
+      .finally(() => {
+        if (!disposed) setProjectsLoading(false)
+      })
+    return () => { disposed = true }
   }, [])
 
-  const handleCreateProject = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!projectName.trim()) return
-
-    const payload = {
-      name: projectName.trim(),
-      description: projectDescription.trim() || 'New production concept awaiting story development.',
-      status: projectStatus,
-      genre: projectGenre,
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setStories([])
+      setCharacters([])
+      setScenes([])
+      setActiveStory(null)
+      setGenerationJob(null)
+      setStoryTitle('')
+      setStoryPrompt('')
+      setGenre('Fantasy')
+      setArtStyle('Cinematic 3D Anime')
+      setEpisodeDuration(24)
+      setCharacterCount(3)
+      setStorySaved(true)
+      setSelectedCharacterId(null)
+      setCharacterDraft(EMPTY_CHARACTER)
+      setSelectedSceneId('')
+      setGenerationPrompt('')
+      setWorkspaceLoading(false)
+      return
     }
 
-    try {
-      const response = await fetch(`${API_BASE}/api/projects`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+    let disposed = false
+    setWorkspaceLoading(true)
+    setPageError('')
+    setStories([])
+    setCharacters([])
+    setScenes([])
+    setActiveStory(null)
+    setGenerationJob(null)
+
+    const queryProject = `?project_id=${encodeURIComponent(selectedProjectId)}`
+    Promise.all([
+      requestJson<Story[]>(`/api/stories${queryProject}`),
+      requestJson<Character[]>(`/api/characters${queryProject}`),
+      requestJson<Scene[]>(`/api/projects/${encodeURIComponent(selectedProjectId)}/scenes`),
+    ])
+      .then(([loadedStories, loadedCharacters, loadedScenes]) => {
+        if (disposed) return
+        setStories(loadedStories)
+        setCharacters(loadedCharacters)
+        setScenes(loadedScenes)
+        const selectedStory = loadedStories[0] ?? null
+        setActiveStory(selectedStory)
+        setStoryTitle(selectedStory?.title ?? '')
+        setStoryPrompt(selectedStory?.prompt ?? '')
+        setGenre(selectedStory?.genre ?? 'Fantasy')
+        setArtStyle(selectedStory?.art_style ?? 'Cinematic 3D Anime')
+        setEpisodeDuration(selectedStory?.episode_duration ?? 24)
+        setCharacterCount(selectedStory?.character_count ?? 3)
+        setStorySaved(true)
+        setSelectedCharacterId(null)
+        setCharacterDraft(EMPTY_CHARACTER)
+        setSelectedSceneId(loadedScenes[0]?.id ?? '')
+      })
+      .catch((error: unknown) => {
+        if (!disposed) setPageError(`Could not load this project's production data: ${getErrorMessage(error)}`)
+      })
+      .finally(() => {
+        if (!disposed) setWorkspaceLoading(false)
       })
 
-      if (!response.ok) {
-        throw new Error('Project creation failed')
-      }
+    const jobId = preferences.generationJobByProject[selectedProjectId]
+    if (jobId) {
+      requestJson<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(jobId)}`)
+        .then((job) => {
+          if (!disposed) setGenerationJob(job)
+        })
+        .catch((error: unknown) => {
+          if (!disposed) setPageError(`Could not retrieve the saved scene-generation job: ${getErrorMessage(error)}`)
+        })
+    }
 
-      const createdProject = await response.json()
-      setProjects((current) => [createdProject, ...current])
-      setDashboard((current) => ({ ...current, totalProjects: current.totalProjects + 1 }))
-      setStatusMessage('Project saved to backend.')
-      setProjectName('')
-      setProjectDescription('')
-      setProjectStatus('Concept')
-      setProjectGenre('Fantasy')
-    } catch {
-      const fallback: Project = {
-        id: `proj-${Date.now()}`,
-        name: payload.name,
-        description: payload.description,
-        status: payload.status,
-        genre: payload.genre,
-      }
-      setProjects((current) => [fallback, ...current])
-      setDashboard((current) => ({ ...current, totalProjects: current.totalProjects + 1 }))
-      setStatusMessage('Project saved locally while the backend is offline.')
-      setErrorMessage('Backend unreachable. Local persistence remains active.')
+    return () => { disposed = true }
+  }, [selectedProjectId])
+
+  useEffect(() => {
+    if (!selectedProjectId || !generationJob || generationJob.project_id !== selectedProjectId) return
+    if (generationJob.status !== 'queued' && generationJob.status !== 'running') return
+
+    let disposed = false
+    const timer = window.setTimeout(() => {
+      requestJson<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(generationJob.id)}`)
+        .then((job) => {
+          if (!disposed) setGenerationJob(job)
+        })
+        .catch((error: unknown) => {
+          if (!disposed) setPageError(`Could not refresh scene-generation status: ${getErrorMessage(error)}`)
+        })
+    }, 1400)
+    return () => {
+      disposed = true
+      window.clearTimeout(timer)
+    }
+  }, [selectedProjectId, generationJob])
+
+  useEffect(() => {
+    if (!selectedProjectId) return
+    setPreferences((current) => ({
+      ...current,
+      selectedProjectId,
+      stepsByProject: { ...current.stepsByProject, [selectedProjectId]: currentStep },
+    }))
+  }, [selectedProjectId, currentStep])
+
+  const setError = useCallback((message: string) => {
+    setNotice('')
+    setPageError(message)
+  }, [])
+
+  const updateStory = useCallback((updatedStory: Story) => {
+    setActiveStory(updatedStory)
+    setStoryTitle(updatedStory.title)
+    setStoryPrompt(updatedStory.prompt)
+    setStorySaved(false)
+    if (selectedProjectId) {
+      setPreferences((current) => {
+        const approved = { ...current.approvedStoryByProject }
+        delete approved[selectedProjectId]
+        return { ...current, approvedStoryByProject: approved }
+      })
+    }
+  }, [selectedProjectId])
+
+  const handleProjectSelect = (projectId: string) => {
+    setSelectedProjectId(projectId)
+    setCurrentStep(preferences.stepsByProject[projectId] ?? 'story')
+    setView('workflow')
+    setPageError('')
+  }
+
+  const handleCreateProject = async (payload: Pick<Project, 'name' | 'description' | 'status' | 'genre'>) => {
+    setPageError('')
+    try {
+      const project = await requestJson<Project>('/api/projects', {
+        method: 'POST',
+        body: jsonBody(payload),
+      })
+      setProjects((current) => [project, ...current])
+      setSelectedProjectId(project.id)
+      setCurrentStep('story')
+      setView('workflow')
+      setNotice(`Project "${project.name}" created.`)
+      return true
+    } catch (error) {
+      setError(`Could not create project: ${getErrorMessage(error)}`)
+      return false
     }
   }
 
   const handleDeleteProject = async (projectId: string) => {
+    setPageError('')
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${projectId}`, { method: 'DELETE' })
-      if (!response.ok) {
-        throw new Error('Delete failed')
+      await requestJson<void>(`/api/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' })
+      const remaining = projects.filter((project) => project.id !== projectId)
+      setProjects(remaining)
+      if (projectId === selectedProjectId) {
+        const nextId = remaining[0]?.id ?? ''
+        setSelectedProjectId(nextId)
+        setCurrentStep('story')
       }
-      setProjects((current) => current.filter((project) => project.id !== projectId))
-      setDashboard((current) => ({ ...current, totalProjects: Math.max(0, current.totalProjects - 1) }))
-      setStatusMessage('Project deleted from backend.')
-    } catch {
-      setProjects((current) => current.filter((project) => project.id !== projectId))
-      setStatusMessage('Project removed from local view.')
-      setErrorMessage('Backend unreachable. Local data was updated instead.')
+      setNotice('Project deleted.')
+    } catch (error) {
+      setError(`Could not delete project: ${getErrorMessage(error)}`)
     }
   }
 
   const handleGenerateStory = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!prompt.trim()) return
-
-    const payload = {
-      prompt: prompt.trim(),
-      genre,
-      art_style: artStyle,
-      episode_duration: episodeDuration,
-      character_count: characterCount,
-    }
-
+    if (!selectedProjectId) return
+    setStoryGenerating(true)
+    setPageError('')
+    setNotice('')
     try {
-      const response = await fetch(`${API_BASE}/api/stories/generate`, {
+      const story = await requestJson<Story>('/api/stories/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: jsonBody({
+          title: storyTitle.trim(),
+          prompt: storyPrompt.trim(),
+          genre,
+          tone,
+          art_style: artStyle,
+          episode_duration: episodeDuration,
+          character_count: characterCount,
+          project_id: selectedProjectId,
+        }),
       })
-
-      if (!response.ok) {
-        throw new Error('Story generation failed')
-      }
-
-      const createdStory = await response.json()
-      setStories((current) => [createdStory, ...current])
-      setStatusMessage('Story generated and saved to the backend.')
-      setPrompt('')
-    } catch {
-      const fallbackStory: Story = {
-        id: `story-${Date.now()}`,
-        title: payload.prompt.split(' ').slice(0, 5).join(' ') || 'New Story',
-        prompt: payload.prompt,
-        genre: payload.genre,
-        art_style: payload.art_style,
-        episode_duration: payload.episode_duration,
-        character_count: payload.character_count,
-        outline: [
-          { title: 'Opening Hook', description: `The story opens with a cinematic reveal in a ${payload.genre.toLowerCase()} world.` },
-          { title: 'Character Arc', description: `${payload.character_count} characters navigate conflict and identity.` },
-          { title: 'Crescendo', description: `A ${payload.episode_duration}-minute finale resolves the central arc.` },
-        ],
-      }
-      setStories((current) => [fallbackStory, ...current])
-      setStatusMessage('Story saved locally while the backend is offline.')
-      setErrorMessage('Story generation fell back to local storage.')
+      setStories((current) => [story, ...current.filter((item) => item.id !== story.id)])
+      setActiveStory(story)
+      setStoryTitle(story.title)
+      setStoryPrompt(story.prompt)
+      setStorySaved(true)
+      setPreferences((current) => {
+        const approved = { ...current.approvedStoryByProject }
+        delete approved[selectedProjectId]
+        return { ...current, approvedStoryByProject: approved }
+      })
+      setNotice('Story outline generated and saved to this project.')
+    } catch (error) {
+      setError(`Story generation failed: ${getErrorMessage(error)}`)
+    } finally {
+      setStoryGenerating(false)
     }
   }
 
-  const handleCreateCharacter = async (event: FormEvent<HTMLFormElement>) => {
+  const handleSaveStory = async () => {
+    if (!activeStory) return
+    setStorySaving(true)
+    setPageError('')
+    try {
+      const saved = await requestJson<Story>(`/api/stories/${encodeURIComponent(activeStory.id)}`, {
+        method: 'PUT',
+        body: jsonBody({
+          title: activeStory.title,
+          prompt: activeStory.prompt,
+          genre: activeStory.genre,
+          art_style: activeStory.art_style,
+          episode_duration: activeStory.episode_duration,
+          character_count: activeStory.character_count,
+          outline: activeStory.outline,
+        }),
+      })
+      setActiveStory(saved)
+      setStories((current) => current.map((story) => story.id === saved.id ? saved : story))
+      setStorySaved(true)
+      setNotice('Story edits saved.')
+    } catch (error) {
+      setError(`Could not save story edits: ${getErrorMessage(error)}`)
+    } finally {
+      setStorySaving(false)
+    }
+  }
+
+  const handleApproveStory = () => {
+    if (!activeStory || !selectedProjectId || !storySaved) return
+    setPreferences((current) => ({
+      ...current,
+      approvedStoryByProject: {
+        ...current.approvedStoryByProject,
+        [selectedProjectId]: activeStory.id,
+      },
+    }))
+    setNotice('Story approved for this browser workflow.')
+  }
+
+  const handleCharacterSelect = (character: Character) => {
+    setSelectedCharacterId(character.id)
+    setCharacterDraft({
+      name: character.name,
+      role: character.role,
+      appearance: character.appearance,
+      personality: character.personality,
+      powers: character.powers,
+      description: character.description,
+      weapon: character.weapon,
+      project_id: selectedProjectId,
+    })
+  }
+
+  const handleNewCharacter = () => {
+    setSelectedCharacterId(null)
+    setCharacterDraft({ ...EMPTY_CHARACTER, project_id: selectedProjectId })
+  }
+
+  const handleSaveCharacter = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!characterName.trim()) return
-
-    const payload = {
-      name: characterName.trim(),
-      role: characterRole,
-      personality: characterPersonality,
-      appearance: characterAppearance || 'Anime-inspired silhouette with cinematic lighting',
-      powers: characterPowers || 'Signature ability pending development',
-      reference_image: '',
-    }
-
+    if (!selectedProjectId) return
+    setCharacterSaving(true)
+    setPageError('')
     try {
-      const response = await fetch(`${API_BASE}/api/characters`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-
-      if (!response.ok) {
-        throw new Error('Character creation failed')
-      }
-
-      const createdCharacter = await response.json()
-      setCharacters((current) => [createdCharacter, ...current])
-      setDashboard((current) => ({ ...current, totalCharacters: current.totalCharacters + 1 }))
-      setStatusMessage('Character saved to backend.')
-      setCharacterName('')
-      setCharacterRole('Hero')
-      setCharacterPersonality('Driven')
-      setCharacterAppearance('')
-      setCharacterPowers('')
-    } catch {
-      const fallbackCharacter: Character = {
-        id: `char-${Date.now()}`,
-        name: payload.name,
-        role: payload.role,
-        personality: payload.personality,
-        appearance: payload.appearance,
-        powers: payload.powers,
-        reference_image: payload.reference_image,
-      }
-      setCharacters((current) => [fallbackCharacter, ...current])
-      setDashboard((current) => ({ ...current, totalCharacters: current.totalCharacters + 1 }))
-      setStatusMessage('Character saved locally while the backend is offline.')
-      setErrorMessage('Character API is unreachable; local persistence is active.')
+      const payload = { ...characterDraft, project_id: selectedProjectId }
+      const character = await requestJson<Character>(
+        selectedCharacterId
+          ? `/api/characters/${encodeURIComponent(selectedCharacterId)}`
+          : '/api/characters',
+        {
+          method: selectedCharacterId ? 'PUT' : 'POST',
+          body: jsonBody(payload),
+        },
+      )
+      setCharacters((current) => selectedCharacterId
+        ? current.map((item) => item.id === character.id ? character : item)
+        : [...current, character])
+      setSelectedCharacterId(character.id)
+      setNotice(selectedCharacterId ? 'Character profile updated.' : 'Character profile created.')
+    } catch (error) {
+      setError(`Could not save character profile: ${getErrorMessage(error)}`)
+    } finally {
+      setCharacterSaving(false)
     }
   }
 
-  const latestStory = stories[0]
+  const handleCreateScene = async (name: string, description: string) => {
+    if (!selectedProjectId) return false
+    try {
+      const scene = await requestJson<Scene>(`/api/projects/${encodeURIComponent(selectedProjectId)}/scenes`, {
+        method: 'POST',
+        body: jsonBody({ name, description }),
+      })
+      setScenes((current) => [...current, scene])
+      setSelectedSceneId(scene.id)
+      setNotice('Storyboard scene added.')
+      return true
+    } catch (error) {
+      setError(`Could not add scene: ${getErrorMessage(error)}`)
+      return false
+    }
+  }
+
+  const handleUpdateScene = async (sceneId: string, name: string, description: string) => {
+    try {
+      const updated = await requestJson<Scene>(`/api/scenes/${encodeURIComponent(sceneId)}`, {
+        method: 'PUT',
+        body: jsonBody({ name, description }),
+      })
+      setScenes((current) => current.map((scene) => scene.id === updated.id ? updated : scene))
+      setNotice('Scene details saved.')
+    } catch (error) {
+      setError(`Could not save scene details: ${getErrorMessage(error)}`)
+    }
+  }
+
+  const handleDeleteScene = async (sceneId: string) => {
+    try {
+      await requestJson<void>(`/api/scenes/${encodeURIComponent(sceneId)}`, { method: 'DELETE' })
+      const remaining = scenes.filter((scene) => scene.id !== sceneId)
+      setScenes(remaining)
+      setSelectedSceneId(remaining[0]?.id ?? '')
+      setNotice('Scene removed from the storyboard.')
+    } catch (error) {
+      setError(`Could not delete scene: ${getErrorMessage(error)}`)
+    }
+  }
+
+  const handleCreateShot = async (sceneId: string, payload: ShotPayload) => {
+    try {
+      const shot = await requestJson<Shot>(`/api/scenes/${encodeURIComponent(sceneId)}/shots`, {
+        method: 'POST',
+        body: jsonBody(payload),
+      })
+      setScenes((current) => current.map((scene) => scene.id === shot.scene_id
+        ? { ...scene, shots: [...scene.shots, shot].sort((a, b) => a.ordering - b.ordering) }
+        : scene))
+      setNotice('Shot added to the storyboard.')
+      return true
+    } catch (error) {
+      setError(`Could not add shot: ${getErrorMessage(error)}`)
+      return false
+    }
+  }
+
+  const handleUpdateShot = async (shotId: string, payload: ShotPayload) => {
+    try {
+      const shot = await requestJson<Shot>(`/api/shots/${encodeURIComponent(shotId)}`, {
+        method: 'PUT',
+        body: jsonBody(payload),
+      })
+      setScenes((current) => current.map((scene) => scene.id === shot.scene_id
+        ? { ...scene, shots: scene.shots.map((item) => item.id === shot.id ? shot : item).sort((a, b) => a.ordering - b.ordering) }
+        : scene))
+      setNotice('Shot changes saved.')
+      return true
+    } catch (error) {
+      setError(`Could not save shot changes: ${getErrorMessage(error)}`)
+      return false
+    }
+  }
+
+  const handleDeleteShot = async (shotId: string) => {
+    const sceneId = scenes.find((scene) => scene.shots.some((shot) => shot.id === shotId))?.id
+    try {
+      await requestJson<{ message: string; id: string }>(`/api/shots/${encodeURIComponent(shotId)}`, { method: 'DELETE' })
+      if (sceneId) {
+        setScenes((current) => current.map((scene) => scene.id === sceneId
+          ? { ...scene, shots: scene.shots.filter((shot) => shot.id !== shotId) }
+          : scene))
+      }
+      setNotice('Shot removed from the sequence.')
+    } catch (error) {
+      setError(`Could not remove shot: ${getErrorMessage(error)}`)
+    }
+  }
+
+  const handleGenerateScene = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!selectedProjectId || !selectedSceneId) return
+    const selectedScene = scenes.find((scene) => scene.id === selectedSceneId)
+    setGenerationSubmitting(true)
+    setPageError('')
+    setNotice('')
+    try {
+      const prompt = `${generationPrompt.trim()}\nStoryboard scene: ${selectedScene?.name ?? ''}`.trim()
+      const job = await requestJson<GenerationJob>(
+        `/api/projects/${encodeURIComponent(selectedProjectId)}/generation-jobs`,
+        { method: 'POST', body: jsonBody({ prompt }) },
+      )
+      setGenerationJob(job)
+      setPreferences((current) => ({
+        ...current,
+        generationJobByProject: {
+          ...current.generationJobByProject,
+          [selectedProjectId]: job.id,
+        },
+      }))
+      setNotice('Scene-generation job submitted.')
+    } catch (error) {
+      setError(`Could not submit Godot scene-generation job: ${getErrorMessage(error)}`)
+    } finally {
+      setGenerationSubmitting(false)
+    }
+  }
+
+  const handleOpenScene = async () => {
+    if (!generationJob) return
+    setOpeningScene(true)
+    setPageError('')
+    try {
+      await requestJson<{ message: string }>(`/api/generation-jobs/${encodeURIComponent(generationJob.id)}/open`, {
+        method: 'POST',
+      })
+      setNotice('The generated scene was sent to Godot.')
+    } catch (error) {
+      setError(`Could not open the generated scene: ${getErrorMessage(error)}`)
+    } finally {
+      setOpeningScene(false)
+    }
+  }
+
+  const stepComplete = useMemo(() => ({
+    story: Boolean(activeStory && storySaved && isApproved),
+    characters: projectCharacters.length > 0,
+    storyboard: scenes.length > 0 && scenes.some((scene) => scene.shots.length > 0),
+    scenes: generationJob?.project_id === selectedProjectId && generationJob.status === 'completed',
+    animation: true,
+    'final-video': true,
+  }), [activeStory, storySaved, isApproved, projectCharacters.length, scenes, generationJob, selectedProjectId])
+
+  const stepIndex = STEPS.indexOf(currentStep)
+  const canContinue = stepComplete[currentStep]
+  const canNavigateTo = (target: WorkflowStepId) => {
+    const targetIndex = STEPS.indexOf(target)
+    if (targetIndex <= stepIndex) return true
+    return STEPS.slice(0, targetIndex).every((step) => stepComplete[step])
+  }
+
+  const handleContinue = () => {
+    if (!canContinue || stepIndex >= STEPS.length - 1) return
+    setCurrentStep(STEPS[stepIndex + 1])
+    setPageError('')
+  }
+
+  const handleStepSelect = (step: WorkflowStepId) => {
+    if (!canNavigateTo(step)) return
+    setCurrentStep(step)
+    setView('workflow')
+    setPageError('')
+  }
+
+  const stepProps = {
+    projects,
+    selectedProject,
+    selectedProjectId,
+    currentStep,
+    onProjectSelect: handleProjectSelect,
+    onProjectCreate: handleCreateProject,
+    onProjectDelete: handleDeleteProject,
+    canNavigateToStep: canNavigateTo,
+    onStepSelect: handleStepSelect,
+    canContinue,
+    nextLabel: stepIndex < STEPS.length - 1 ? `Continue to ${STEP_LABELS[STEPS[stepIndex + 1]]}` : 'Continue',
+    onContinue: handleContinue,
+    onBack: () => setCurrentStep(STEPS[Math.max(stepIndex - 1, 0)]),
+    view,
+    onViewSelect: setView,
+  }
 
   return (
-    <div className="studio-shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">AnimeForge AI</p>
-          <h1>Production command center</h1>
-        </div>
-        <button type="button" className="primary-button">Create project</button>
-      </header>
-
-      {(statusMessage || errorMessage) && (
-        <div className="notice-stack">
-          {statusMessage && <div className="notice success">{statusMessage}</div>}
-          {errorMessage && <div className="notice error">{errorMessage}</div>}
-        </div>
-      )}
-
-      <main className="page-grid">
-        <section className="panel hero-panel">
-          <div className="hero-copy">
-            <p className="eyebrow accent">Studio overview</p>
-            <h2>Turn prompts into cinematic anime production workflows.</h2>
-            <p>
-              Draft stories, build reusable character sheets, stage shots, and track production readiness without
-              relying on paid AI services.
-            </p>
+    <StudioFrame {...stepProps}>
+      <div className="studio-main-content">
+        <div className="workspace-topline">
+          <div className="workspace-project">
+            <span className="project-signal" />
+            <span>{STEP_LABELS[currentStep]} / {STEP_LABELS[currentStep] === '3D Scenes' ? 'ENVIRONMENT' : 'DEVELOPMENT'}</span>
           </div>
-
-          <div className="stats-grid">
-            <div className="stat-card">
-              <span>Total projects</span>
-              <strong>{loading ? '…' : dashboard.totalProjects}</strong>
-            </div>
-            <div className="stat-card">
-              <span>Total characters</span>
-              <strong>{loading ? '…' : dashboard.totalCharacters}</strong>
-            </div>
-            <div className="stat-card">
-              <span>Total scenes</span>
-              <strong>{loading ? '…' : dashboard.totalScenes}</strong>
-            </div>
-            <div className="stat-card">
-              <span>Completed renders</span>
-              <strong>{loading ? '…' : dashboard.completedRenders}</strong>
-            </div>
-          </div>
-        </section>
-
-        <div className="content-columns">
-          <section className="panel">
-            <div className="section-header">
-              <h3>Recent projects</h3>
-              <span>Live list</span>
-            </div>
-            <div className="project-list">
-              {projects.length === 0 ? <p className="empty-state">No projects yet.</p> : projects.map((project) => (
-                <article className="project-card" key={project.id}>
-                  <div>
-                    <div className="project-heading">
-                      <h4>{project.name}</h4>
-                      <span className="badge">{project.status}</span>
-                    </div>
-                    <p>{project.description}</p>
-                  </div>
-
-                  <div className="project-meta">
-                    <span>{project.genre}</span>
-                    <button type="button" onClick={() => void handleDeleteProject(project.id)}>Delete</button>
-                  </div>
-                </article>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="section-header">
-              <h3>Recent activity</h3>
-              <span>Live</span>
-            </div>
-            <ul className="activity-list">
-              {dashboard.activity.map((item) => (
-                <li key={`${item.title}-${item.time}`}>
-                  <div>
-                    <strong>{item.title}</strong>
-                    <p>{item.detail}</p>
-                  </div>
-                  <span>{item.time}</span>
-                </li>
-              ))}
-            </ul>
-          </section>
+          <span className="workspace-context">{view === 'workflow' ? 'PRODUCTION WORKSPACE' : 'STUDIO PREFERENCES'}</span>
         </div>
 
-        <div className="workspace-grid">
-          <section className="panel">
-            <div className="section-header">
-              <h3>New project</h3>
-              <span>Backend sync</span>
-            </div>
-
-            <form className="stack-form" onSubmit={(event) => void handleCreateProject(event)}>
-              <label>
-                Project name
-                <input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="Neon Ember" />
-              </label>
-              <label>
-                Description
-                <textarea value={projectDescription} onChange={(event) => setProjectDescription(event.target.value)} placeholder="What kind of story or production is this?" rows={4} />
-              </label>
-              <div className="inline-fields">
-                <label>
-                  Status
-                  <select value={projectStatus} onChange={(event) => setProjectStatus(event.target.value)}>
-                    <option>Concept</option>
-                    <option>Storyboarding</option>
-                    <option>In Progress</option>
-                    <option>Ready</option>
-                  </select>
-                </label>
-                <label>
-                  Genre
-                  <select value={projectGenre} onChange={(event) => setProjectGenre(event.target.value)}>
-                    <option>Fantasy</option>
-                    <option>Sci-Fi</option>
-                    <option>Action</option>
-                    <option>Romance</option>
-                  </select>
-                </label>
-              </div>
-              <button type="submit" className="primary-button">Save project</button>
-            </form>
-          </section>
-
-          <section className="panel">
-            <div className="section-header">
-              <h3>Story generator</h3>
-              <span>Demo generator</span>
-            </div>
-
-            <form className="stack-form" onSubmit={(event) => void handleGenerateStory(event)}>
-              <label>
-                Story prompt
-                <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={5} />
-              </label>
-              <div className="inline-fields">
-                <label>
-                  Genre
-                  <select value={genre} onChange={(event) => setGenre(event.target.value)}>
-                    <option>Fantasy</option>
-                    <option>Sci-Fi</option>
-                    <option>Action</option>
-                    <option>Drama</option>
-                  </select>
-                </label>
-                <label>
-                  Art style
-                  <select value={artStyle} onChange={(event) => setArtStyle(event.target.value)}>
-                    <option>Cinematic 3D Anime</option>
-                    <option>Moody Studio Anime</option>
-                    <option>Action Shonen</option>
-                    <option>Lighthearted Slice of Life</option>
-                  </select>
-                </label>
-              </div>
-              <div className="inline-fields">
-                <label>
-                  Duration
-                  <input type="number" min={6} max={60} value={episodeDuration} onChange={(event) => setEpisodeDuration(Number(event.target.value))} />
-                </label>
-                <label>
-                  Characters
-                  <input type="number" min={1} max={12} value={characterCount} onChange={(event) => setCharacterCount(Number(event.target.value))} />
-                </label>
-              </div>
-              <button type="submit" className="primary-button">Generate story</button>
-            </form>
-
-            {latestStory ? (
-              <div className="story-preview">
-                <h4>{latestStory.title}</h4>
-                <p>{latestStory.prompt}</p>
-                <ul>
-                  {latestStory.outline.map((item) => (
-                    <li key={item.title}>
-                      <strong>{item.title}</strong>
-                      <span>{item.description}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-          </section>
-        </div>
-
-        <div className="workspace-grid">
-          <section className="panel">
-            <div className="section-header">
-              <h3>Character studio</h3>
-              <span>Reusable cast</span>
-            </div>
-
-            <form className="stack-form" onSubmit={(event) => void handleCreateCharacter(event)}>
-              <label>
-                Character name
-                <input value={characterName} onChange={(event) => setCharacterName(event.target.value)} placeholder="Aoi Kisaragi" />
-              </label>
-              <div className="inline-fields">
-                <label>
-                  Role
-                  <select value={characterRole} onChange={(event) => setCharacterRole(event.target.value)}>
-                    <option>Hero</option>
-                    <option>Mentor</option>
-                    <option>Villain</option>
-                    <option>Supporting</option>
-                  </select>
-                </label>
-                <label>
-                  Personality
-                  <input value={characterPersonality} onChange={(event) => setCharacterPersonality(event.target.value)} />
-                </label>
-              </div>
-              <label>
-                Appearance
-                <input value={characterAppearance} onChange={(event) => setCharacterAppearance(event.target.value)} placeholder="Blue hair, layered coat, glowing eyes" />
-              </label>
-              <label>
-                Powers and abilities
-                <input value={characterPowers} onChange={(event) => setCharacterPowers(event.target.value)} placeholder="Starlight blade" />
-              </label>
-              <button type="submit" className="primary-button">Save character</button>
-            </form>
-
-            <div className="character-list">
-              {characters.length === 0 ? <p className="empty-state">No characters yet.</p> : characters.map((character) => (
-                <article key={character.id} className="character-card">
-                  <h4>{character.name}</h4>
-                  <p>{character.role}</p>
-                  <span>{character.personality}</span>
-                  <small>{character.appearance}</small>
-                  <small>{character.powers}</small>
-                </article>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="section-header">
-              <h3>3D production studio</h3>
-              <span>Blender status</span>
-            </div>
-
-            <div className="status-stack">
-              <div className="status-item">
-                <span>Blender</span>
-                <strong>Not detected</strong>
-              </div>
-              <div className="status-item">
-                <span>Environment pack</span>
-                <strong>6 ready</strong>
-              </div>
-              <div className="status-item">
-                <span>Render queue</span>
-                <strong>3 frames pending</strong>
-              </div>
-              <div className="status-item">
-                <span>Output format</span>
-                <strong>MP4 / 1080p</strong>
-              </div>
-            </div>
-          </section>
-        </div>
-
-        <section className="panel settings-panel">
-          <div className="section-header">
-            <h3>Settings</h3>
-            <span>System health</span>
+        {(pageError || notice) && (
+          <div className={`feedback-banner ${pageError ? 'is-error' : 'is-success'}`} role={pageError ? 'alert' : 'status'}>
+            <span>{pageError || notice}</span>
+            <button type="button" className="feedback-dismiss" onClick={() => { setPageError(''); setNotice('') }} aria-label="Dismiss message">x</button>
           </div>
+        )}
 
-          <div className="settings-grid">
-            <div>
-              <span>Backend</span>
-              <strong>Healthy</strong>
-            </div>
-            <div>
-              <span>Database</span>
-              <strong>SQLAlchemy / MySQL</strong>
-            </div>
-            <div>
-              <span>Theme</span>
-              <strong>Dark anime studio</strong>
-            </div>
-            <div>
-              <span>AI services</span>
-              <strong>Local demo only</strong>
-            </div>
+        {projectsLoading || workspaceLoading ? (
+          <div className="loading-workspace">
+            <span className="loading-mark" />
+            <p>{projectsLoading ? 'Loading projects from the backend...' : 'Loading project production data...'}</p>
           </div>
-        </section>
-      </main>
-    </div>
+        ) : (
+          <>
+            <div className="workflow-step-content" hidden={view !== 'workflow'} key={selectedProjectId}>
+              <div hidden={currentStep !== 'story'}>
+                <StoryStep
+                  project={selectedProject}
+                  story={activeStory}
+                  title={storyTitle}
+                  prompt={storyPrompt}
+                  genre={genre}
+                  tone={tone}
+                  artStyle={artStyle}
+                  episodeDuration={episodeDuration}
+                  characterCount={characterCount}
+                  generating={storyGenerating}
+                  saving={storySaving}
+                  storyIsSaved={storySaved}
+                  isApproved={isApproved}
+                  onTitleChange={(value) => {
+                    setStoryTitle(value)
+                    if (activeStory) updateStory({ ...activeStory, title: value })
+                  }}
+                  onPromptChange={(value) => {
+                    setStoryPrompt(value)
+                    if (activeStory) updateStory({ ...activeStory, prompt: value })
+                  }}
+                  onGenreChange={(value) => {
+                    setGenre(value)
+                    if (activeStory) updateStory({ ...activeStory, genre: value })
+                  }}
+                  onToneChange={setTone}
+                  onArtStyleChange={(value) => {
+                    setArtStyle(value)
+                    if (activeStory) updateStory({ ...activeStory, art_style: value })
+                  }}
+                  onEpisodeDurationChange={(value) => {
+                    setEpisodeDuration(value)
+                    if (activeStory) updateStory({ ...activeStory, episode_duration: value })
+                  }}
+                  onCharacterCountChange={(value) => {
+                    setCharacterCount(value)
+                    if (activeStory) updateStory({ ...activeStory, character_count: value })
+                  }}
+                  onGenerate={handleGenerateStory}
+                  onStoryChange={updateStory}
+                  onSave={handleSaveStory}
+                  onApprove={handleApproveStory}
+                />
+              </div>
+              <div hidden={currentStep !== 'characters'}>
+                <CharactersStep
+                  characters={projectCharacters}
+                  draft={characterDraft}
+                  selectedCharacterId={selectedCharacterId}
+                  saving={characterSaving}
+                  onDraftChange={setCharacterDraft}
+                  onSelect={handleCharacterSelect}
+                  onNew={handleNewCharacter}
+                  onSave={handleSaveCharacter}
+                />
+              </div>
+              <div hidden={currentStep !== 'storyboard'}>
+                <StoryboardStep
+                  scenes={scenes}
+                  selectedSceneId={selectedSceneId}
+                  onSelectScene={setSelectedSceneId}
+                  onCreateScene={handleCreateScene}
+                  onUpdateScene={handleUpdateScene}
+                  onDeleteScene={handleDeleteScene}
+                  onCreateShot={handleCreateShot}
+                  onUpdateShot={handleUpdateShot}
+                  onDeleteShot={handleDeleteShot}
+                />
+              </div>
+              <div hidden={currentStep !== 'scenes'}>
+                <SceneGenerationStep
+                  scenes={scenes}
+                  selectedSceneId={selectedSceneId}
+                  prompt={generationPrompt}
+                  job={generationJob}
+                  generating={generationSubmitting}
+                  opening={openingScene}
+                  onSceneSelect={setSelectedSceneId}
+                  onPromptChange={setGenerationPrompt}
+                  onGenerate={handleGenerateScene}
+                  onOpenScene={handleOpenScene}
+                  apiBase={API_BASE}
+                />
+              </div>
+              <div hidden={currentStep !== 'animation'}>
+                <AnimationStep scenes={scenes} characters={projectCharacters} />
+              </div>
+              <div hidden={currentStep !== 'final-video'}>
+                <FinalVideoStep project={selectedProject} story={activeStory} characters={projectCharacters} scenes={scenes} />
+              </div>
+            </div>
+            {view !== 'workflow' && <AuxiliaryStep view={view} />}
+          </>
+        )}
+      </div>
+    </StudioFrame>
   )
 }
-
-export default App

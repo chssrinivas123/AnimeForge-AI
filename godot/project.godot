@@ -1,0 +1,14 @@
+; Engine configuration file.
+; Keep this project compatible with low-memory integrated graphics.
+
+config_version=5
+
+[application]
+
+config/name="AnimeForge Scene Generator"
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.055, 0.075, 0.12, 1)

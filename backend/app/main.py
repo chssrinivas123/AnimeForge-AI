@@ -1,13 +1,26 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+import os
+from datetime import datetime
 from typing import Any
-from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.database.init_db import init_db
+from app.database.session import SessionLocal
+from app.models import Character as CharacterModel
+from app.models import Project as ProjectModel
+from app.models import RenderJob, Scene, Story as StoryModel
+from app.services.story_service import build_story_outline
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AnimeForge AI",
@@ -24,10 +37,6 @@ app.add_middleware(
 )
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=3, max_length=120)
     description: str = Field(default="", max_length=800)
@@ -37,8 +46,8 @@ class ProjectCreate(BaseModel):
 
 class Project(ProjectCreate):
     id: str
-    created_at: str
-    updated_at: str
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class StoryGenerateRequest(BaseModel):
@@ -63,7 +72,7 @@ class Story(BaseModel):
     episode_duration: int
     character_count: int
     outline: list[StoryItem]
-    created_at: str
+    created_at: str | None = None
 
 
 class CharacterCreate(BaseModel):
@@ -77,7 +86,7 @@ class CharacterCreate(BaseModel):
 
 class Character(CharacterCreate):
     id: str
-    created_at: str
+    created_at: str | None = None
 
 
 class AuthUser(BaseModel):
@@ -86,109 +95,98 @@ class AuthUser(BaseModel):
     role: str = "Producer"
 
 
-projects: list[Project] = [
-    Project(
-        id="proj-1",
-        name="Moonlit Vanguard",
-        description="A rogue squad of celestial guardians protects a dying city in a crystal sky."
-        ,
-        status="In Progress",
-        genre="Sci-Fi",
-        created_at=utc_now(),
-        updated_at=utc_now(),
-    ),
-    Project(
-        id="proj-2",
-        name="Skybound Archive",
-        description="A fallen archivist discovers lost memories inside floating ruins.",
-        status="Storyboarding",
-        genre="Fantasy",
-        created_at=utc_now(),
-        updated_at=utc_now(),
-    ),
-]
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-stories: list[Story] = [
-    Story(
-        id="story-1",
-        title="Moonlit Vanguard",
-        prompt="A young pilot learns to control a celestial mech to save a city drifting above the clouds.",
-        genre="Sci-Fi",
-        art_style="Cinematic 3D Anime",
-        episode_duration=24,
-        character_count=5,
-        outline=[
-            StoryItem(title="Act I", description="The city begins to lose gravity and the pilot is recruited for a risky rescue."),
-            StoryItem(title="Act II", description="A hidden rebellion reveals the mechanical heart that powers the city."),
-            StoryItem(title="Act III", description="The pilot sacrifices their freedom to save the city and protect its citizens."),
+
+@app.on_event("startup")
+def startup_event() -> None:
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        logger.info("Skipping startup database initialization during pytest execution.")
+        return
+
+    try:
+        init_db()
+    except SQLAlchemyError:
+        logger.exception("Failed to initialize database. Application will run in degraded mode.")
+
+
+def to_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat(timespec="seconds")
+
+
+def serialize_project(project: ProjectModel) -> dict[str, Any]:
+    return {
+        "id": project.id,
+        "name": project.name,
+        "description": project.description,
+        "status": project.status,
+        "genre": project.genre,
+        "created_at": to_iso(project.created_at),
+        "updated_at": to_iso(project.updated_at),
+    }
+
+
+def serialize_character(character: CharacterModel) -> dict[str, Any]:
+    return {
+        "id": character.id,
+        "name": character.name,
+        "role": character.role,
+        "personality": character.personality,
+        "appearance": character.appearance,
+        "powers": character.powers,
+        "reference_image": character.reference_image or "",
+        "created_at": to_iso(character.created_at),
+    }
+
+
+def serialize_story(story: StoryModel) -> dict[str, Any]:
+    outline = story.outline or []
+    return {
+        "id": story.id,
+        "title": story.title,
+        "prompt": story.prompt,
+        "genre": story.genre,
+        "art_style": story.art_style,
+        "episode_duration": story.episode_duration,
+        "character_count": story.character_count,
+        "outline": [
+            {"title": item.get("title", "Scene"), "description": item.get("description", "")}
+            for item in outline
         ],
-        created_at=utc_now(),
-    )
-]
-
-characters: list[Character] = [
-    Character(
-        id="char-1",
-        name="Ari Sol",
-        role="Hero",
-        personality="Brave and stubborn",
-        appearance="Silver hair, cyan visor, layered combat coat",
-        powers="Stellar pulse dash",
-        reference_image="",
-        created_at=utc_now(),
-    )
-]
-
-
-def build_story_outline(prompt: str, genre: str, art_style: str, episode_duration: int, character_count: int) -> list[StoryItem]:
-    clean_prompt = prompt.strip()
-    title_anchor = clean_prompt.split()[:6]
-    title = " ".join(title_anchor).title() if title_anchor else "New Story"
-
-    return [
-        StoryItem(
-            title="Opening Hook",
-            description=f"{title} begins with a cinematic reveal of the world and the central conflict in a {genre.lower()} setting.",
-        ),
-        StoryItem(
-            title="Character Arc",
-            description=f"{character_count} core characters navigate loyalty, identity, and sacrifice while the art direction stays {art_style.lower()}.",
-        ),
-        StoryItem(
-            title="Crescendo",
-            description=f"At {episode_duration} minutes, the story locks into a high-stakes battle that resolves the emotional threads and leads to a hopeful or tragic finale.",
-        ),
-        StoryItem(
-            title="Visual Breakdown",
-            description="Scene beats are staged for dynamic camera motion, layered VFX, and emotionally grounded anime dialogue pacing.",
-        ),
-    ]
+        "created_at": to_iso(story.created_at),
+    }
 
 
 @app.get("/")
 def home() -> dict[str, str]:
-    return {
-        "message": "Welcome to AnimeForge AI!",
-        "status": "Backend is running",
-    }
+    return {"message": "Welcome to AnimeForge AI!", "status": "Backend is running"}
 
 
 @app.get("/api/health")
 def health_check() -> dict[str, str]:
-    return {
-        "status": "healthy",
-        "application": "AnimeForge AI",
-    }
+    return {"status": "healthy", "application": "AnimeForge AI"}
 
 
 @app.get("/api/dashboard")
-def dashboard() -> dict[str, Any]:
+def dashboard(db: Session = Depends(get_db)) -> dict[str, Any]:
+    projects = db.query(ProjectModel).order_by(ProjectModel.created_at.desc()).limit(3).all()
+    characters = db.query(CharacterModel).count()
+    scenes = db.query(Scene).count()
+    completed_renders = db.query(RenderJob).filter(RenderJob.status == "completed").count()
+
     return {
-        "totalProjects": len(projects),
-        "totalCharacters": len(characters),
-        "totalScenes": 18,
-        "completedRenders": 7,
-        "projects": projects[:3],
+        "totalProjects": db.query(ProjectModel).count(),
+        "totalCharacters": characters,
+        "totalScenes": scenes,
+        "completedRenders": completed_renders,
+        "projects": [serialize_project(project) for project in projects],
         "activity": [
             {"title": "Storyboard approved", "detail": "Episode 02 used the cinematic dev preview.", "time": "2h ago"},
             {"title": "New character unlocked", "detail": "Ari Sol was added to the prototype cast.", "time": "5h ago"},
@@ -198,96 +196,147 @@ def dashboard() -> dict[str, Any]:
 
 
 @app.get("/api/projects")
-def list_projects() -> list[Project]:
-    return projects
+def list_projects(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    projects = db.query(ProjectModel).order_by(ProjectModel.created_at.desc()).all()
+    return [serialize_project(project) for project in projects]
+
+
+@app.get("/api/projects/{project_id}")
+def get_project(project_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    project = db.get(ProjectModel, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    return serialize_project(project)
 
 
 @app.post("/api/projects", status_code=201)
-def create_project(project: ProjectCreate) -> Project:
-    new_project = Project(
-        id=f"proj-{uuid4().hex[:8]}",
+def create_project(project: ProjectCreate, db: Session = Depends(get_db)) -> dict[str, Any]:
+    model = ProjectModel(
         name=project.name,
         description=project.description,
         status=project.status,
         genre=project.genre,
-        created_at=utc_now(),
-        updated_at=utc_now(),
     )
-    projects.append(new_project)
-    return new_project
+    db.add(model)
+    db.commit()
+    db.refresh(model)
+    return serialize_project(model)
 
 
 @app.put("/api/projects/{project_id}")
-def update_project(project_id: str, project: ProjectCreate) -> Project:
-    for current in projects:
-        if current.id == project_id:
-            current.name = project.name
-            current.description = project.description
-            current.status = project.status
-            current.genre = project.genre
-            current.updated_at = utc_now()
-            return current
-    raise HTTPException(status_code=404, detail="Project not found")
+def update_project(project_id: str, project: ProjectCreate, db: Session = Depends(get_db)) -> dict[str, Any]:
+    model = db.get(ProjectModel, project_id)
+    if model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    model.name = project.name
+    model.description = project.description
+    model.status = project.status
+    model.genre = project.genre
+    db.commit()
+    db.refresh(model)
+    return serialize_project(model)
 
 
 @app.delete("/api/projects/{project_id}")
-def delete_project(project_id: str) -> dict[str, Any]:
-    for index, current in enumerate(projects):
-        if current.id == project_id:
-            del projects[index]
-            return {"message": "Project deleted", "id": project_id}
-    raise HTTPException(status_code=404, detail="Project not found")
+def delete_project(project_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    model = db.get(ProjectModel, project_id)
+    if model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    db.delete(model)
+    db.commit()
+    return {"message": "Project deleted", "id": project_id}
 
 
 @app.get("/api/stories")
-def list_stories() -> list[Story]:
-    return stories
+def list_stories(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    stories = db.query(StoryModel).order_by(StoryModel.created_at.desc()).all()
+    return [serialize_story(story) for story in stories]
 
 
 @app.post("/api/stories/generate", status_code=201)
-def generate_story(request: StoryGenerateRequest) -> Story:
-    title_words = request.prompt.strip().split()[:5]
-    story_title = " ".join(title_words).title() if title_words else "Story Draft"
-    story = Story(
-        id=f"story-{uuid4().hex[:8]}",
-        title=story_title,
+def generate_story(request: StoryGenerateRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    story_title = request.prompt.strip().split()[:5]
+    title = " ".join(story_title).title() if story_title else "Story Draft"
+    outline = build_story_outline(
+        request.prompt,
+        request.genre,
+        request.art_style,
+        request.episode_duration,
+        request.character_count,
+    )
+    story = StoryModel(
+        title=title,
         prompt=request.prompt,
         genre=request.genre,
         art_style=request.art_style,
         episode_duration=request.episode_duration,
         character_count=request.character_count,
-        outline=build_story_outline(
-            request.prompt,
-            request.genre,
-            request.art_style,
-            request.episode_duration,
-            request.character_count,
-        ),
-        created_at=utc_now(),
+        outline=outline,
     )
-    stories.insert(0, story)
-    return story
+    db.add(story)
+    db.commit()
+    db.refresh(story)
+    return serialize_story(story)
 
 
 @app.get("/api/characters")
-def list_characters() -> list[Character]:
-    return characters
+def list_characters(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    characters = db.query(CharacterModel).order_by(CharacterModel.created_at.desc()).all()
+    return [serialize_character(character) for character in characters]
+
+
+@app.get("/api/characters/{character_id}")
+def get_character(character_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    character = db.get(CharacterModel, character_id)
+    if character is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found")
+    return serialize_character(character)
 
 
 @app.post("/api/characters", status_code=201)
-def create_character(character: CharacterCreate) -> Character:
-    new_character = Character(
-        id=f"char-{uuid4().hex[:8]}",
+def create_character(character: CharacterCreate, db: Session = Depends(get_db)) -> dict[str, Any]:
+    model = CharacterModel(
         name=character.name,
         role=character.role,
         personality=character.personality,
         appearance=character.appearance,
         powers=character.powers,
         reference_image=character.reference_image,
-        created_at=utc_now(),
     )
-    characters.append(new_character)
-    return new_character
+    db.add(model)
+    db.commit()
+    db.refresh(model)
+    return serialize_character(model)
+
+
+@app.put("/api/characters/{character_id}")
+def update_character(character_id: str, character: CharacterCreate, db: Session = Depends(get_db)) -> dict[str, Any]:
+    model = db.get(CharacterModel, character_id)
+    if model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found")
+
+    model.name = character.name
+    model.role = character.role
+    model.personality = character.personality
+    model.appearance = character.appearance
+    model.powers = character.powers
+    model.reference_image = character.reference_image
+    db.commit()
+    db.refresh(model)
+    return serialize_character(model)
+
+
+@app.delete("/api/characters/{character_id}")
+def delete_character(character_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    model = db.get(CharacterModel, character_id)
+    if model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found")
+
+    db.delete(model)
+    db.commit()
+    return {"message": "Character deleted", "id": character_id}
 
 
 @app.get("/api/settings")
@@ -295,7 +344,7 @@ def settings() -> dict[str, Any]:
     return {
         "project_name": "AnimeForge AI",
         "backend_status": "online",
-        "database_status": "demo-memory-mode",
+        "database_status": "MySQL 8 via SQLAlchemy",
         "blender_status": "not detected",
         "application_config": {
             "theme": "dark-anime-studio",

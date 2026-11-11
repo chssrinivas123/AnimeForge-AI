@@ -1,5 +1,8 @@
-import { useEffect, useState } from 'react'
+import { type FormEvent, useEffect, useState } from 'react'
 import './App.css'
+
+const API_BASE = 'http://127.0.0.1:8000'
+const STORAGE_KEY = 'animeforge-ui'
 
 type Project = {
   id: string
@@ -27,6 +30,7 @@ type Character = {
   personality: string
   appearance: string
   powers: string
+  reference_image?: string
 }
 
 type ActivityItem = {
@@ -35,68 +39,34 @@ type ActivityItem = {
   time: string
 }
 
-const initialProjects: Project[] = [
-  {
-    id: 'proj-1',
-    name: 'Moonlit Vanguard',
-    description: 'A rogue squad of celestial guardians protects a city suspended above the storm roof.',
-    status: 'In Progress',
-    genre: 'Sci-Fi',
-  },
-  {
-    id: 'proj-2',
-    name: 'Skybound Archive',
-    description: 'A fallen archivist recovers memories hidden inside floating ruins.',
-    status: 'Storyboarding',
-    genre: 'Fantasy',
-  },
-]
+type DashboardData = {
+  totalProjects: number
+  totalCharacters: number
+  totalScenes: number
+  completedRenders: number
+  activity: ActivityItem[]
+}
 
-const initialStories: Story[] = [
-  {
-    id: 'story-1',
-    title: 'Moonlit Vanguard',
-    prompt: 'A young pilot learns to control a celestial mech to save a city drifting above the clouds.',
-    genre: 'Sci-Fi',
-    art_style: 'Cinematic 3D Anime',
-    episode_duration: 24,
-    character_count: 5,
-    outline: [
-      { title: 'Act I', description: 'The city begins to lose gravity and the pilot is recruited for a risky rescue.' },
-      { title: 'Act II', description: 'A hidden rebellion reveals the mechanical heart power source of the city.' },
-      { title: 'Act III', description: 'The pilot sacrifices their freedom to protect the city and its citizens.' },
-    ],
-  },
-]
-
-const initialCharacters: Character[] = [
-  {
-    id: 'char-1',
-    name: 'Ari Sol',
-    role: 'Hero',
-    personality: 'Driven and stubborn',
-    appearance: 'Silver hair, cyan visor, layered combat coat',
-    powers: 'Stellar pulse dash',
-  },
-]
-
-const defaultDashboard = {
-  totalProjects: initialProjects.length,
-  totalCharacters: initialCharacters.length,
-  totalScenes: 18,
-  completedRenders: 7,
+const initialDashboard: DashboardData = {
+  totalProjects: 0,
+  totalCharacters: 0,
+  totalScenes: 0,
+  completedRenders: 0,
   activity: [
     { title: 'Storyboard approved', detail: 'Episode 02 used the cinematic dev preview.', time: '2h ago' },
     { title: 'New character unlocked', detail: 'Ari Sol was added to the prototype cast.', time: '5h ago' },
     { title: 'Render queued', detail: 'Final shot package is waiting on GPU approval.', time: '1d ago' },
-  ] as ActivityItem[],
+  ],
 }
 
 function App() {
-  const [projects, setProjects] = useState<Project[]>(initialProjects)
-  const [stories, setStories] = useState<Story[]>(initialStories)
-  const [characters, setCharacters] = useState<Character[]>(initialCharacters)
-  const [dashboard, setDashboard] = useState(defaultDashboard)
+  const [projects, setProjects] = useState<Project[]>([])
+  const [stories, setStories] = useState<Story[]>([])
+  const [characters, setCharacters] = useState<Character[]>([])
+  const [dashboard, setDashboard] = useState<DashboardData>(initialDashboard)
+  const [loading, setLoading] = useState(true)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
 
   const [projectName, setProjectName] = useState('')
   const [projectDescription, setProjectDescription] = useState('')
@@ -116,97 +86,225 @@ function App() {
   const [characterPowers, setCharacterPowers] = useState('')
 
   useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/dashboard')
-      .then((response) => response.json())
-      .then((data) => {
-        if (data && typeof data.totalProjects === 'number') {
-          setDashboard({
-            totalProjects: data.totalProjects,
-            totalCharacters: data.totalCharacters,
-            totalScenes: data.totalScenes,
-            completedRenders: data.completedRenders,
-            activity: data.activity ?? defaultDashboard.activity,
-          })
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved) as {
+          projects?: Project[]
+          characters?: Character[]
+          stories?: Story[]
         }
-      })
-      .catch(() => {
-        // Demo mode defaults remain active when the backend is not running.
-      })
+        if (parsed.projects) setProjects(parsed.projects)
+        if (parsed.characters) setCharacters(parsed.characters)
+        if (parsed.stories) setStories(parsed.stories)
+      } catch {
+        localStorage.removeItem(STORAGE_KEY)
+      }
+    }
   }, [])
 
-  const handleCreateProject = (event: React.FormEvent<HTMLFormElement>) => {
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ projects, characters, stories }))
+  }, [projects, characters, stories])
+
+  const loadDashboard = async () => {
+    try {
+      const [dashboardResponse, projectsResponse, charactersResponse, storiesResponse] = await Promise.all([
+        fetch(`${API_BASE}/api/dashboard`),
+        fetch(`${API_BASE}/api/projects`),
+        fetch(`${API_BASE}/api/characters`),
+        fetch(`${API_BASE}/api/stories`),
+      ])
+
+      if (!dashboardResponse.ok || !projectsResponse.ok || !charactersResponse.ok || !storiesResponse.ok) {
+        throw new Error('Backend API unavailable')
+      }
+
+      const dashboardData = await dashboardResponse.json()
+      const projectData = await projectsResponse.json()
+      const characterData = await charactersResponse.json()
+      const storyData = await storiesResponse.json()
+
+      setDashboard({
+        totalProjects: dashboardData.totalProjects ?? projectData.length,
+        totalCharacters: dashboardData.totalCharacters ?? characterData.length,
+        totalScenes: dashboardData.totalScenes ?? 0,
+        completedRenders: dashboardData.completedRenders ?? 0,
+        activity: dashboardData.activity ?? initialDashboard.activity,
+      })
+      setProjects(projectData)
+      setCharacters(characterData)
+      setStories(storyData)
+      setErrorMessage(null)
+    } catch {
+      setDashboard((current) => ({ ...current, totalProjects: current.totalProjects || projects.length || 1 }))
+      setErrorMessage('Backend is unavailable; showing locally persisted data.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadDashboard()
+  }, [])
+
+  const handleCreateProject = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!projectName.trim()) return
 
-    const newProject: Project = {
-      id: `proj-${Date.now()}`,
+    const payload = {
       name: projectName.trim(),
       description: projectDescription.trim() || 'New production concept awaiting story development.',
       status: projectStatus,
       genre: projectGenre,
     }
 
-    setProjects((current) => [newProject, ...current])
-    setDashboard((current) => ({
-      ...current,
-      totalProjects: current.totalProjects + 1,
-    }))
-    setProjectName('')
-    setProjectDescription('')
-    setProjectStatus('Concept')
-    setProjectGenre('Fantasy')
+    try {
+      const response = await fetch(`${API_BASE}/api/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+
+      if (!response.ok) {
+        throw new Error('Project creation failed')
+      }
+
+      const createdProject = await response.json()
+      setProjects((current) => [createdProject, ...current])
+      setDashboard((current) => ({ ...current, totalProjects: current.totalProjects + 1 }))
+      setStatusMessage('Project saved to backend.')
+      setProjectName('')
+      setProjectDescription('')
+      setProjectStatus('Concept')
+      setProjectGenre('Fantasy')
+    } catch {
+      const fallback: Project = {
+        id: `proj-${Date.now()}`,
+        name: payload.name,
+        description: payload.description,
+        status: payload.status,
+        genre: payload.genre,
+      }
+      setProjects((current) => [fallback, ...current])
+      setDashboard((current) => ({ ...current, totalProjects: current.totalProjects + 1 }))
+      setStatusMessage('Project saved locally while the backend is offline.')
+      setErrorMessage('Backend unreachable. Local persistence remains active.')
+    }
   }
 
-  const handleGenerateStory = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleDeleteProject = async (projectId: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/projects/${projectId}`, { method: 'DELETE' })
+      if (!response.ok) {
+        throw new Error('Delete failed')
+      }
+      setProjects((current) => current.filter((project) => project.id !== projectId))
+      setDashboard((current) => ({ ...current, totalProjects: Math.max(0, current.totalProjects - 1) }))
+      setStatusMessage('Project deleted from backend.')
+    } catch {
+      setProjects((current) => current.filter((project) => project.id !== projectId))
+      setStatusMessage('Project removed from local view.')
+      setErrorMessage('Backend unreachable. Local data was updated instead.')
+    }
+  }
+
+  const handleGenerateStory = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!prompt.trim()) return
 
-    const generatedStory: Story = {
-      id: `story-${Date.now()}`,
-      title: prompt.trim().split(' ').slice(0, 5).join(' ').replace(/\s+/g, ' ').trim() || 'New Story',
+    const payload = {
       prompt: prompt.trim(),
       genre,
       art_style: artStyle,
       episode_duration: episodeDuration,
       character_count: characterCount,
-      outline: [
-        { title: 'Opening Hook', description: `The story opens with a cinematic reveal in a ${genre.toLowerCase()} world where the central conflict quickly escalates.` },
-        { title: 'Character Arc', description: `${characterCount} core characters navigate identity, loyalty, and sacrifice while the ${artStyle.toLowerCase()} direction remains consistent.` },
-        { title: 'Crescendo', description: `A ${episodeDuration}-minute finale explodes into a high-stakes climax that resolves the emotional and visual threads.` },
-      ],
     }
 
-    setStories((current) => [generatedStory, ...current])
-    setPrompt('')
+    try {
+      const response = await fetch(`${API_BASE}/api/stories/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+
+      if (!response.ok) {
+        throw new Error('Story generation failed')
+      }
+
+      const createdStory = await response.json()
+      setStories((current) => [createdStory, ...current])
+      setStatusMessage('Story generated and saved to the backend.')
+      setPrompt('')
+    } catch {
+      const fallbackStory: Story = {
+        id: `story-${Date.now()}`,
+        title: payload.prompt.split(' ').slice(0, 5).join(' ') || 'New Story',
+        prompt: payload.prompt,
+        genre: payload.genre,
+        art_style: payload.art_style,
+        episode_duration: payload.episode_duration,
+        character_count: payload.character_count,
+        outline: [
+          { title: 'Opening Hook', description: `The story opens with a cinematic reveal in a ${payload.genre.toLowerCase()} world.` },
+          { title: 'Character Arc', description: `${payload.character_count} characters navigate conflict and identity.` },
+          { title: 'Crescendo', description: `A ${payload.episode_duration}-minute finale resolves the central arc.` },
+        ],
+      }
+      setStories((current) => [fallbackStory, ...current])
+      setStatusMessage('Story saved locally while the backend is offline.')
+      setErrorMessage('Story generation fell back to local storage.')
+    }
   }
 
-  const handleCreateCharacter = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleCreateCharacter = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!characterName.trim()) return
 
-    const newCharacter: Character = {
-      id: `char-${Date.now()}`,
+    const payload = {
       name: characterName.trim(),
       role: characterRole,
       personality: characterPersonality,
       appearance: characterAppearance || 'Anime-inspired silhouette with cinematic lighting',
       powers: characterPowers || 'Signature ability pending development',
+      reference_image: '',
     }
 
-    setCharacters((current) => [newCharacter, ...current])
-    setDashboard((current) => ({
-      ...current,
-      totalCharacters: current.totalCharacters + 1,
-    }))
-    setCharacterName('')
-    setCharacterRole('Hero')
-    setCharacterPersonality('Driven')
-    setCharacterAppearance('')
-    setCharacterPowers('')
-  }
+    try {
+      const response = await fetch(`${API_BASE}/api/characters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
 
-  const handleDeleteProject = (projectId: string) => {
-    setProjects((current) => current.filter((project) => project.id !== projectId))
+      if (!response.ok) {
+        throw new Error('Character creation failed')
+      }
+
+      const createdCharacter = await response.json()
+      setCharacters((current) => [createdCharacter, ...current])
+      setDashboard((current) => ({ ...current, totalCharacters: current.totalCharacters + 1 }))
+      setStatusMessage('Character saved to backend.')
+      setCharacterName('')
+      setCharacterRole('Hero')
+      setCharacterPersonality('Driven')
+      setCharacterAppearance('')
+      setCharacterPowers('')
+    } catch {
+      const fallbackCharacter: Character = {
+        id: `char-${Date.now()}`,
+        name: payload.name,
+        role: payload.role,
+        personality: payload.personality,
+        appearance: payload.appearance,
+        powers: payload.powers,
+        reference_image: payload.reference_image,
+      }
+      setCharacters((current) => [fallbackCharacter, ...current])
+      setDashboard((current) => ({ ...current, totalCharacters: current.totalCharacters + 1 }))
+      setStatusMessage('Character saved locally while the backend is offline.')
+      setErrorMessage('Character API is unreachable; local persistence is active.')
+    }
   }
 
   const latestStory = stories[0]
@@ -220,6 +318,13 @@ function App() {
         </div>
         <button type="button" className="primary-button">Create project</button>
       </header>
+
+      {(statusMessage || errorMessage) && (
+        <div className="notice-stack">
+          {statusMessage && <div className="notice success">{statusMessage}</div>}
+          {errorMessage && <div className="notice error">{errorMessage}</div>}
+        </div>
+      )}
 
       <main className="page-grid">
         <section className="panel hero-panel">
@@ -235,19 +340,19 @@ function App() {
           <div className="stats-grid">
             <div className="stat-card">
               <span>Total projects</span>
-              <strong>{dashboard.totalProjects}</strong>
+              <strong>{loading ? '…' : dashboard.totalProjects}</strong>
             </div>
             <div className="stat-card">
               <span>Total characters</span>
-              <strong>{dashboard.totalCharacters}</strong>
+              <strong>{loading ? '…' : dashboard.totalCharacters}</strong>
             </div>
             <div className="stat-card">
               <span>Total scenes</span>
-              <strong>{dashboard.totalScenes}</strong>
+              <strong>{loading ? '…' : dashboard.totalScenes}</strong>
             </div>
             <div className="stat-card">
               <span>Completed renders</span>
-              <strong>{dashboard.completedRenders}</strong>
+              <strong>{loading ? '…' : dashboard.completedRenders}</strong>
             </div>
           </div>
         </section>
@@ -256,10 +361,10 @@ function App() {
           <section className="panel">
             <div className="section-header">
               <h3>Recent projects</h3>
-              <span>Demo backlog</span>
+              <span>Live list</span>
             </div>
             <div className="project-list">
-              {projects.map((project) => (
+              {projects.length === 0 ? <p className="empty-state">No projects yet.</p> : projects.map((project) => (
                 <article className="project-card" key={project.id}>
                   <div>
                     <div className="project-heading">
@@ -271,9 +376,7 @@ function App() {
 
                   <div className="project-meta">
                     <span>{project.genre}</span>
-                    <button type="button" onClick={() => handleDeleteProject(project.id)}>
-                      Delete
-                    </button>
+                    <button type="button" onClick={() => void handleDeleteProject(project.id)}>Delete</button>
                   </div>
                 </article>
               ))}
@@ -303,10 +406,10 @@ function App() {
           <section className="panel">
             <div className="section-header">
               <h3>New project</h3>
-              <span>Prototype</span>
+              <span>Backend sync</span>
             </div>
 
-            <form className="stack-form" onSubmit={handleCreateProject}>
+            <form className="stack-form" onSubmit={(event) => void handleCreateProject(event)}>
               <label>
                 Project name
                 <input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="Neon Ember" />
@@ -345,7 +448,7 @@ function App() {
               <span>Demo generator</span>
             </div>
 
-            <form className="stack-form" onSubmit={handleGenerateStory}>
+            <form className="stack-form" onSubmit={(event) => void handleGenerateStory(event)}>
               <label>
                 Story prompt
                 <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={5} />
@@ -407,7 +510,7 @@ function App() {
               <span>Reusable cast</span>
             </div>
 
-            <form className="stack-form" onSubmit={handleCreateCharacter}>
+            <form className="stack-form" onSubmit={(event) => void handleCreateCharacter(event)}>
               <label>
                 Character name
                 <input value={characterName} onChange={(event) => setCharacterName(event.target.value)} placeholder="Aoi Kisaragi" />
@@ -439,7 +542,7 @@ function App() {
             </form>
 
             <div className="character-list">
-              {characters.map((character) => (
+              {characters.length === 0 ? <p className="empty-state">No characters yet.</p> : characters.map((character) => (
                 <article key={character.id} className="character-card">
                   <h4>{character.name}</h4>
                   <p>{character.role}</p>
@@ -491,7 +594,7 @@ function App() {
             </div>
             <div>
               <span>Database</span>
-              <strong>Demo memory mode</strong>
+              <strong>SQLAlchemy / MySQL</strong>
             </div>
             <div>
               <span>Theme</span>
